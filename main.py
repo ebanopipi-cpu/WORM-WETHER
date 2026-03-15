@@ -1,16 +1,18 @@
 import asyncio
 import logging
 import os
+import time
 from decimal import Decimal, ROUND_HALF_UP
+from collections import defaultdict
 from dotenv import load_dotenv
 import aiohttp
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.default import DefaultBotProperties  # ВАЖНО: ДОБАВЛЕНО!
+from aiogram.client.default import DefaultBotProperties
 
 # Загружаем переменные из .env файла
 load_dotenv()
@@ -23,6 +25,36 @@ if not TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 
+# ========== ANTI-SPAM MIDDLEWARE ==========
+class AntiSpamMiddleware(BaseMiddleware):
+    """Защита от флуда - не дает спамить командами"""
+    def __init__(self, rate_limit=2, per_seconds=3):
+        self.rate_limit = rate_limit
+        self.per_seconds = per_seconds
+        self.user_timestamps = defaultdict(list)
+        
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, types.Message):
+            return await handler(event, data)
+            
+        user_id = event.from_user.id
+        now = time.time()
+        
+        # Очищаем старые записи
+        self.user_timestamps[user_id] = [
+            ts for ts in self.user_timestamps[user_id] 
+            if now - ts < self.per_seconds
+        ]
+        
+        # Проверяем лимит
+        if len(self.user_timestamps[user_id]) >= self.rate_limit:
+            await event.answer("⏳ Не так быстро! Подожди пару секунд.")
+            return
+            
+        self.user_timestamps[user_id].append(now)
+        return await handler(event, data)
+
+
 # Состояния для конвертации
 class ConvertStates(StatesGroup):
     waiting_for_amount = State()
@@ -30,10 +62,14 @@ class ConvertStates(StatesGroup):
     waiting_for_to_currency = State()
 
 
-# Класс для получения курса валют и крипты
+# ========== УСКОРЕННЫЙ КЛАСС ДЛЯ КУРСОВ ==========
 class CurrencyAPI:
     def __init__(self):
         self.session = None
+        # Кэш для хранения курсов {from_curr_to_curr: {'rate': value, 'decimal': Decimal, 'timestamp': time}}
+        self.cache = {}
+        self.cache_ttl = 600  # 10 минут (600 секунд)
+        
         # Фиатные валюты
         self.fiat_currencies = {
             'RUB': '🇷🇺 RUB',
@@ -58,7 +94,7 @@ class CurrencyAPI:
             'TRX': '◈ TRX (Tron)',
             'MATIC': '⬡ MATIC (Polygon)'
         }
-
+        
         # Маппинг ID для CoinGecko
         self.crypto_ids = {
             'BTC': 'bitcoin',
@@ -72,110 +108,210 @@ class CurrencyAPI:
             'TRX': 'tron',
             'MATIC': 'matic-network'
         }
-
+        
     async def get_session(self):
-        if self.session is None:
+        if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
 
+    def _get_cache_key(self, from_currency, to_currency):
+        return f"{from_currency}_{to_currency}"
+    
+    def _get_from_cache(self, from_currency, to_currency):
+        """Получить курс из кэша, если он свежий"""
+        key = self._get_cache_key(from_currency, to_currency)
+        if key in self.cache:
+            data = self.cache[key]
+            if time.time() - data['timestamp'] < self.cache_ttl:
+                return data
+            else:
+                # Протухло - удаляем
+                del self.cache[key]
+        return None
+    
+    def _save_to_cache(self, from_currency, to_currency, rate_float):
+        """Сохранить курс в кэш"""
+        key = self._get_cache_key(from_currency, to_currency)
+        self.cache[key] = {
+            'rate_float': rate_float,
+            'rate_decimal': Decimal(str(rate_float)),
+            'timestamp': time.time()
+        }
+
     async def get_rate(self, from_currency, to_currency):
-        """Получаем курс валют/крипты"""
+        """Получаем курс валют/крипты с использованием кэша"""
+        # Проверяем кэш
+        cached = self._get_from_cache(from_currency, to_currency)
+        if cached:
+            return cached['rate_decimal']
+        
+        # Если в кэше нет - идем в API
         try:
             session = await self.get_session()
-
+            
             # Определяем тип валют
             from_is_crypto = from_currency in self.crypto_currencies
             to_is_crypto = to_currency in self.crypto_currencies
-
-            # Для крипты используем CoinGecko
+            
+            rate_float = None
+            
+            # Для крипты используем Binance (быстрее) или CoinGecko
             if from_is_crypto or to_is_crypto:
-                return await self.get_crypto_rate(from_currency, to_currency, from_is_crypto, to_is_crypto)
+                rate_float = await self._get_crypto_rate_fast(from_currency, to_currency, from_is_crypto, to_is_crypto)
             else:
-                # Для фиатных валют используем exchangerate-api
-                return await self.get_fiat_rate(from_currency, to_currency)
-
+                # Для фиатных валют используем floatrates (быстрее exchangerate-api)
+                rate_float = await self._get_fiat_rate_fast(from_currency, to_currency)
+            
+            if rate_float:
+                # Сохраняем в кэш
+                self._save_to_cache(from_currency, to_currency, rate_float)
+                return Decimal(str(rate_float))
+            
         except Exception as e:
             logging.error(f"Ошибка получения курса {from_currency}→{to_currency}: {e}")
-            return self.get_default_rate(from_currency, to_currency)
-
-    async def get_crypto_rate(self, from_currency, to_currency, from_is_crypto, to_is_crypto):
-        """Получение курса с участием криптовалют"""
-        session = await self.get_session()
-
-        # Если обе криптовалюты
-        if from_is_crypto and to_is_crypto:
-            # Получаем обе цены в USD
-            from_price = await self.get_crypto_price_in_usd(from_currency)
-            to_price = await self.get_crypto_price_in_usd(to_currency)
-
-            if from_price and to_price:
-                return round(from_price / to_price, 8)
-
-        # Если из крипты в фиат
-        elif from_is_crypto and not to_is_crypto:
-            price_in_usd = await self.get_crypto_price_in_usd(from_currency)
-            if price_in_usd and to_currency == 'USD':
-                return round(price_in_usd, 2)
-            elif price_in_usd:
-                # Конвертируем USD в целевую фиатную валюту
-                usd_rate = await self.get_fiat_rate('USD', to_currency)
-                if usd_rate:
-                    return round(price_in_usd * usd_rate, 4)
-
-        # Если из фиата в крипту
-        elif not from_is_crypto and to_is_crypto:
-            if from_currency == 'USD':
-                price_in_usd = await self.get_crypto_price_in_usd(to_currency)
-                if price_in_usd:
-                    return round(1 / price_in_usd, 8)
-            else:
-                # Конвертируем фиат в USD, потом в крипту
-                usd_rate = await self.get_fiat_rate(from_currency, 'USD')
-                if usd_rate:
-                    price_in_usd = await self.get_crypto_price_in_usd(to_currency)
-                    if price_in_usd:
-                        return round(usd_rate / price_in_usd, 8)
-
+        
+        # Если всё сломалось - возвращаем примерный курс
+        default_rate = self._get_default_rate(from_currency, to_currency)
+        if default_rate:
+            self._save_to_cache(from_currency, to_currency, default_rate)
+            return Decimal(str(default_rate))
+        
         return None
-
-    async def get_crypto_price_in_usd(self, crypto):
-        """Получение цены криптовалюты в USD"""
+    
+    async def _get_fiat_rate_fast(self, from_currency, to_currency):
+        """Быстрый API для фиатных валют (floatrates)"""
         try:
             session = await self.get_session()
-            crypto_id = self.crypto_ids.get(crypto)
-            if not crypto_id:
-                return None
-
+            # floatrates отдает JSON быстрее чем exchangerate-api
             async with session.get(
-                    f"https://api.coingecko.com/api/v3/simple/price?ids={crypto_id}&vs_currencies=usd",
-                    timeout=10
+                f"http://www.floatrates.com/daily/{from_currency.lower()}.json",
+                timeout=5
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if crypto_id in data and 'usd' in data[crypto_id]:
-                        return data[crypto_id]['usd']
-        except Exception as e:
-            logging.error(f"Ошибка получения цены {crypto}: {e}")
-        return None
-
-    async def get_fiat_rate(self, from_currency, to_currency):
-        """Курс фиатных валют через exchangerate-api"""
+                    if to_currency.lower() in data:
+                        return data[to_currency.lower()]['rate']
+        except:
+            pass
+        
+        # Если floatrates не сработал - пробуем exchangerate-api
+        return await self._get_fiat_rate_backup(from_currency, to_currency)
+    
+    async def _get_fiat_rate_backup(self, from_currency, to_currency):
+        """Запасной API для фиатных валют"""
         try:
             session = await self.get_session()
             async with session.get(
-                    f"https://api.exchangerate-api.com/v4/latest/{from_currency}",
-                    timeout=10
+                f"https://api.exchangerate-api.com/v4/latest/{from_currency}",
+                timeout=5
             ) as response:
                 if response.status == 200:
                     data = await response.json()
                     if 'rates' in data and to_currency in data['rates']:
-                        return round(data['rates'][to_currency], 4)
+                        return data['rates'][to_currency]
         except:
             pass
         return None
-
-    def get_default_rate(self, from_currency, to_currency):
-        """Возвращает примерный курс для популярных пар"""
+    
+    async def _get_crypto_rate_fast(self, from_currency, to_currency, from_is_crypto, to_is_crypto):
+        """Быстрый API для крипты (Binance)"""
+        try:
+            session = await self.get_session()
+            
+            # Binance API очень быстрый
+            if from_is_crypto and not to_is_crypto and to_currency == 'USD':
+                # BTC → USD
+                symbol = f"{from_currency}USDT"
+                async with session.get(
+                    f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+                    timeout=5
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return float(data['price'])
+            
+            elif not from_is_crypto and to_is_crypto and from_currency == 'USD':
+                # USD → BTC
+                symbol = f"{to_currency}USDT"
+                async with session.get(
+                    f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+                    timeout=5
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        price = float(data['price'])
+                        return 1 / price
+            
+        except:
+            pass
+        
+        # Если Binance не сработал - используем CoinGecko
+        return await self._get_crypto_rate_backup(from_currency, to_currency, from_is_crypto, to_is_crypto)
+    
+    async def _get_crypto_rate_backup(self, from_currency, to_currency, from_is_crypto, to_is_crypto):
+        """Запасной API для крипты (CoinGecko)"""
+        try:
+            session = await self.get_session()
+            
+            if from_is_crypto and to_is_crypto:
+                # крипта → крипта
+                from_id = self.crypto_ids.get(from_currency)
+                to_id = self.crypto_ids.get(to_currency)
+                if from_id and to_id:
+                    async with session.get(
+                        f"https://api.coingecko.com/api/v3/simple/price?ids={from_id},{to_id}&vs_currencies=usd",
+                        timeout=5
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if from_id in data and to_id in data:
+                                from_price = data[from_id]['usd']
+                                to_price = data[to_id]['usd']
+                                return from_price / to_price
+            
+            elif from_is_crypto and not to_is_crypto:
+                # крипта → фиат
+                from_id = self.crypto_ids.get(from_currency)
+                if from_id:
+                    async with session.get(
+                        f"https://api.coingecko.com/api/v3/simple/price?ids={from_id}&vs_currencies=usd",
+                        timeout=5
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if from_id in data:
+                                price_usd = data[from_id]['usd']
+                                if to_currency == 'USD':
+                                    return price_usd
+                                else:
+                                    usd_rate = await self._get_fiat_rate_fast('USD', to_currency)
+                                    if usd_rate:
+                                        return price_usd * usd_rate
+            
+            elif not from_is_crypto and to_is_crypto:
+                # фиат → крипта
+                to_id = self.crypto_ids.get(to_currency)
+                if to_id:
+                    async with session.get(
+                        f"https://api.coingecko.com/api/v3/simple/price?ids={to_id}&vs_currencies=usd",
+                        timeout=5
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if to_id in data:
+                                price_usd = data[to_id]['usd']
+                                if from_currency == 'USD':
+                                    return 1 / price_usd
+                                else:
+                                    usd_rate = await self._get_fiat_rate_fast(from_currency, 'USD')
+                                    if usd_rate:
+                                        return usd_rate / price_usd
+        except:
+            pass
+        return None
+    
+    def _get_default_rate(self, from_currency, to_currency):
+        """Примерные курсы для популярных пар"""
         default_rates = {
             ('RUB', 'KZT'): 6.15,
             ('KZT', 'RUB'): 0.16,
@@ -194,46 +330,48 @@ class CurrencyAPI:
             ('BTC', 'ETH'): 18.50,
             ('ETH', 'BTC'): 0.054,
         }
-        return default_rates.get((from_currency, to_currency), None)
+        return default_rates.get((from_currency, to_currency))
 
-    async def get_all_crypto_prices(self, vs_currency='USD'):
-        """Получаем цены всех криптовалют"""
-        try:
-            session = await self.get_session()
-            crypto_ids = [self.crypto_ids[c] for c in self.crypto_currencies.keys() if c in self.crypto_ids]
-            ids_param = ','.join(crypto_ids)
-
-            async with session.get(
-                    f"https://api.coingecko.com/api/v3/simple/price?ids={ids_param}&vs_currencies={vs_currency.lower()}",
-                    timeout=10
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    prices = {}
-                    # Создаем обратный маппинг
-                    id_to_code = {v: k for k, v in self.crypto_ids.items()}
-
-                    for crypto_id, price_data in data.items():
-                        if crypto_id in id_to_code and vs_currency.lower() in price_data:
-                            code = id_to_code[crypto_id]
-                            prices[code] = price_data[vs_currency.lower()]
-                    return prices
-        except Exception as e:
-            logging.error(f"Ошибка получения цен криптовалют: {e}")
-        return None
+    async def get_all_rates(self, base="USD"):
+        """Получаем курсы всех валют к базовой (параллельно)"""
+        tasks = []
+        currencies = []
+        
+        # Собираем все валюты (фиат + крипта)
+        all_currencies = list(self.fiat_currencies.keys()) + list(self.crypto_currencies.keys())
+        
+        for currency in all_currencies:
+            if currency != base:
+                tasks.append(self.get_rate(base, currency))
+                currencies.append(currency)
+        
+        # Запускаем все запросы параллельно
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Собираем только успешные результаты
+        rates = {}
+        for currency, result in zip(currencies, results):
+            if isinstance(result, Decimal) and result > 0:
+                rates[currency] = float(result)
+        
+        return rates
 
     async def close(self):
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
 
 
-# ========== ИНИЦИАЛИЗАЦИЯ - ИСПРАВЛЕНО ==========
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Подключаем middleware
+dp.message.middleware(AntiSpamMiddleware())
+
 currency_api = CurrencyAPI()
 
 
@@ -282,7 +420,7 @@ def get_crypto_keyboard():
 
 
 def get_popular_pairs_keyboard():
-    """Клавиатура с популярными парами (фиат + крипта)"""
+    """Клавиатура с популярными парами"""
     buttons = [
         [KeyboardButton(text="🇷🇺 RUB → 🇰🇿 KZT"), KeyboardButton(text="🇰🇿 KZT → 🇷🇺 RUB")],
         [KeyboardButton(text="🇺🇸 USD → 🇷🇺 RUB"), KeyboardButton(text="🇷🇺 RUB → 🇺🇸 USD")],
@@ -330,16 +468,24 @@ async def conversion_start(message: types.Message, state: FSMContext):
 async def show_fiat_rates(message: types.Message):
     """Показать курсы фиатных валют к USD"""
     wait_msg = await message.answer("⏳ Получаю курсы валют...")
-
+    
     rates_text = "<b>📊 Курсы валют к USD</b>\n\n"
-
+    
+    tasks = []
+    currencies = []
+    
     for code, name in currency_api.fiat_currencies.items():
         if code != 'USD':
-            rate = await currency_api.get_fiat_rate('USD', code)
-            if rate:
-                flag = name.split()[0]
-                rates_text += f"{flag} 1 USD = {rate} {code}\n"
-
+            tasks.append(currency_api.get_rate('USD', code))
+            currencies.append((code, name.split()[0]))
+    
+    # Параллельно получаем все курсы
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for (code, flag), result in zip(currencies, results):
+        if isinstance(result, Decimal) and result > 0:
+            rates_text += f"{flag} 1 USD = {float(result):.2f} {code}\n"
+    
     await wait_msg.delete()
     await message.answer(rates_text, reply_markup=get_main_keyboard())
 
@@ -348,16 +494,18 @@ async def show_fiat_rates(message: types.Message):
 async def show_crypto_prices(message: types.Message):
     """Показать цены криптовалют"""
     wait_msg = await message.answer("⏳ Получаю цены криптовалют...")
-
-    prices = await currency_api.get_all_crypto_prices('USD')
-
+    
+    prices = await currency_api.get_all_rates('USD')
+    
     if prices:
         text = "<b>₿ Цены криптовалют (USD)</b>\n\n"
-        for code, price in prices.items():
+        crypto_prices = {k: v for k, v in prices.items() if k in currency_api.crypto_currencies}
+        
+        for code, price in crypto_prices.items():
             full_name = currency_api.crypto_currencies[code]
             symbol = full_name.split()[0]
             text += f"{symbol} {code}: ${price:,.2f}\n"
-
+        
         await wait_msg.delete()
         await message.answer(text, reply_markup=get_main_keyboard())
     else:
@@ -403,7 +551,7 @@ async def back_to_menu(message: types.Message, state: FSMContext):
 async def back_to_previous(message: types.Message, state: FSMContext):
     """Возврат на шаг назад"""
     current_state = await state.get_state()
-
+    
     if current_state == ConvertStates.waiting_for_from_currency:
         await state.clear()
         await start_command(message)
@@ -442,24 +590,23 @@ async def select_crypto_from(message: types.Message, state: FSMContext):
     )
 
 
-# Обработка выбора валюты
 @dp.message(ConvertStates.waiting_for_from_currency)
 async def process_from_currency(message: types.Message, state: FSMContext):
     """Выбор исходной валюты"""
     if message.text in ["💵 Фиатные валюты", "₿ Криптовалюта", "◀ Назад", "◀ Назад в меню"]:
         return
-
+    
     # Проверяем, что выбрана валюта из списка
     currency_code = None
     currency_type = None
-
+    
     # Проверяем фиатные
     for code, name in currency_api.fiat_currencies.items():
         if code in message.text or (len(message.text) > 2 and message.text[-3:] == code):
             currency_code = code
             currency_type = 'fiat'
             break
-
+    
     # Проверяем крипту
     if not currency_code:
         for code, name in currency_api.crypto_currencies.items():
@@ -467,7 +614,7 @@ async def process_from_currency(message: types.Message, state: FSMContext):
                 currency_code = code
                 currency_type = 'crypto'
                 break
-
+    
     if currency_code:
         await state.update_data(from_currency=currency_code, from_type=currency_type)
         await state.set_state(ConvertStates.waiting_for_to_currency)
@@ -484,17 +631,17 @@ async def process_to_currency(message: types.Message, state: FSMContext):
     """Выбор целевой валюты"""
     if message.text in ["💵 Фиатные валюты", "₿ Криптовалюта", "◀ Назад", "◀ Назад в меню"]:
         return
-
+    
     currency_code = None
     currency_type = None
-
+    
     # Проверяем фиатные
     for code, name in currency_api.fiat_currencies.items():
         if code in message.text or (len(message.text) > 2 and message.text[-3:] == code):
             currency_code = code
             currency_type = 'fiat'
             break
-
+    
     # Проверяем крипту
     if not currency_code:
         for code, name in currency_api.crypto_currencies.items():
@@ -502,23 +649,23 @@ async def process_to_currency(message: types.Message, state: FSMContext):
                 currency_code = code
                 currency_type = 'crypto'
                 break
-
+    
     if currency_code:
         data = await state.get_data()
-
+        
         if currency_code == data['from_currency']:
             await message.answer("❌ Валюты должны быть разными! Выбери другую:")
             return
-
+        
         await state.update_data(to_currency=currency_code, to_type=currency_type)
         await state.set_state(ConvertStates.waiting_for_amount)
-
+        
         from_name = data['from_currency']
         if data['from_type'] == 'fiat':
             from_name = currency_api.fiat_currencies[data['from_currency']]
         else:
             from_name = currency_api.crypto_currencies[data['from_currency']]
-
+        
         await message.answer(
             f"💵 <b>Введи сумму</b> в {from_name}:",
             reply_markup=get_back_keyboard()
@@ -527,7 +674,6 @@ async def process_to_currency(message: types.Message, state: FSMContext):
         await message.answer("❌ Выбери валюту из списка!")
 
 
-# Обработка популярных пар
 @dp.message(F.text.in_([
     "🇷🇺 RUB → 🇰🇿 KZT", "🇰🇿 KZT → 🇷🇺 RUB",
     "🇺🇸 USD → 🇷🇺 RUB", "🇷🇺 RUB → 🇺🇸 USD",
@@ -546,72 +692,69 @@ async def popular_pair_selected(message: types.Message, state: FSMContext):
         "⟠ ETH → 🇺🇸 USD": ("ETH", "crypto", "USD", "fiat"),
         "₿ BTC → ⟠ ETH": ("BTC", "crypto", "ETH", "crypto")
     }
-
+    
     from_curr, from_type, to_curr, to_type = pair_map[message.text]
     await state.update_data(
-        from_currency=from_curr,
+        from_currency=from_curr, 
         from_type=from_type,
-        to_currency=to_curr,
+        to_currency=to_curr, 
         to_type=to_type
     )
     await state.set_state(ConvertStates.waiting_for_amount)
-
+    
     from_name = from_curr
     if from_type == 'fiat':
         from_name = currency_api.fiat_currencies[from_curr]
     else:
         from_name = currency_api.crypto_currencies[from_curr]
-
+    
     await message.answer(
         f"💵 <b>Введи сумму</b> в {from_name}:",
         reply_markup=get_back_keyboard()
     )
 
 
-# Обработка ввода суммы
 @dp.message(ConvertStates.waiting_for_amount)
 async def process_amount(message: types.Message, state: FSMContext):
     """Конвертация суммы"""
     if message.text == "◀ Назад":
         await back_to_previous(message, state)
         return
-
+    
     try:
         # Чистим ввод
         amount = float(message.text.replace(',', '.').replace(' ', ''))
-
+        
         if amount <= 0:
             await message.answer("❌ Сумма должна быть больше 0!")
             return
-
+        
         data = await state.get_data()
         from_curr = data['from_currency']
         to_curr = data['to_currency']
-
+        
         # Показываем процесс
         wait_msg = await message.answer("⏳ Получаю курс...")
-
-        # Получаем курс
+        
+        # Получаем курс (теперь из кэша, если есть)
         rate = await currency_api.get_rate(from_curr, to_curr)
-
+        
         if rate:
             # Считаем результат
-            result = amount * rate
-
+            result = amount * float(rate)
+            
             # Форматируем числа
             if 'BTC' in [from_curr, to_curr] or 'ETH' in [from_curr, to_curr]:
-                # Для крипты больше знаков
-                amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if '.' in f"{amount:.8f}" else f"{amount:.8f}"
-                result_str = f"{result:.8f}".rstrip('0').rstrip('.') if '.' in f"{result:.8f}" else f"{result:.8f}"
-                rate_str = f"{rate:.8f}".rstrip('0').rstrip('.')
+                amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+                result_str = f"{result:.8f}".rstrip('0').rstrip('.')
+                rate_str = f"{float(rate):.8f}".rstrip('0').rstrip('.')
             else:
                 amount_str = f"{amount:,.2f}".replace(',', ' ')
                 result_str = f"{result:,.2f}".replace(',', ' ')
-                rate_str = f"{rate:.4f}".rstrip('0').rstrip('.')
-
+                rate_str = f"{float(rate):.4f}".rstrip('0').rstrip('.')
+            
             await wait_msg.delete()
-
-            # Отправляем результат
+            
             await message.answer(
                 f"✅ <b>{amount_str}</b> {from_curr} = <b>{result_str}</b> {to_curr}\n"
                 f"📈 Курс: 1 {from_curr} = {rate_str} {to_curr}",
@@ -625,7 +768,7 @@ async def process_amount(message: types.Message, state: FSMContext):
                 reply_markup=get_main_keyboard()
             )
             await state.clear()
-
+            
     except ValueError:
         await message.answer("❌ Введи число нормально! (например: 1000 или 0.001)")
     except Exception as e:
@@ -636,7 +779,7 @@ async def process_amount(message: types.Message, state: FSMContext):
 
 # Запуск бота
 async def main():
-    print("🚀 Бот WORM с криптовалютой запущен!")
+    print("🚀 Ускоренный бот WORM с криптовалютой запущен!")
     try:
         await dp.start_polling(bot)
     finally:
